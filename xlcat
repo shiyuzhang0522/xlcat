@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""xlcat: read Excel worksheets as terminal-friendly text. Python >= 3.9."""
+
+import argparse
+import csv
+import datetime
+import itertools
+import os
+from pathlib import Path
+import sys
+
+VERSION = "1.0.0"
+
+
+def positive(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def nonnegative(text):
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return value
+
+
+def cell_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    return str(value)
+
+
+def escaped(text):
+    # One worksheet row per terminal line; prevent cell text emitting controls.
+    result = []
+    replacements = {"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r"}
+    for char in text:
+        if char in replacements:
+            result.append(replacements[char])
+        elif ord(char) < 32 or 127 <= ord(char) <= 159:
+            result.append("\\x{:02x}".format(ord(char)))
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def parser():
+    p = argparse.ArgumentParser(
+        description="Print an Excel worksheet as text (first sheet by default).",
+        epilog="Default: escaped TSV, one physical line per row. Use --tsv or --csv for lossless text fields.",
+    )
+    p.add_argument("file", type=Path, help="Excel .xlsx or .xlsm file")
+    p.add_argument("--version", action="version", version="xlcat " + VERSION)
+    sheet = p.add_mutually_exclusive_group()
+    sheet.add_argument("-s", "--sheet", help="exact worksheet name (including numeric names)")
+    sheet.add_argument("--sheet-index", type=positive, help="worksheet position, starting at 1")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--sheets", action="store_true", help="list worksheet positions and names")
+    mode.add_argument("-n", "--head", type=nonnegative, metavar="N", help="print first N rows, INCLUDING the header")
+    mode.add_argument("--header", action="store_true", help="print just the header row")
+    mode.add_argument("--columns", action="store_true", help="list column number, Excel letter, and header")
+    p.add_argument("--header-row", type=positive, default=1, metavar="R", help="start at Excel row R (default: 1)")
+    p.add_argument("--formulas", action="store_true", help="print formulas instead of saved results")
+    fmt = p.add_mutually_exclusive_group()
+    fmt.add_argument("--tsv", action="store_true", help="standard quoted TSV; embedded newlines are preserved")
+    fmt.add_argument("--csv", action="store_true", help="standard quoted CSV; embedded newlines are preserved")
+    p.add_argument("--reset-dimensions", action="store_true", help="ignore incorrect worksheet dimensions; row widths may vary")
+    return p
+
+
+def run(args):
+    if args.file.suffix.lower() not in (".xlsx", ".xlsm"):
+        raise ValueError("supported formats: .xlsx and .xlsm; convert .xls/.xlsb to .xlsx first")
+    if not args.file.is_file():
+        raise ValueError("file not found: {}".format(args.file))
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise ValueError("missing openpyxl; install in your Python environment: python3 -m pip install openpyxl") from exc
+
+    # Passing a binary handle also permits uppercase filename suffixes.
+    with args.file.open("rb") as source:
+        wb = load_workbook(source, read_only=True, data_only=not args.formulas, keep_links=False)
+        try:
+            sheets = wb.worksheets
+            if args.sheets:
+                for index, ws in enumerate(sheets, 1):
+                    print("{}\t{}".format(index, escaped(ws.title)))
+                return
+            if not sheets:
+                raise ValueError("workbook has no worksheets")
+            if args.sheet is not None:
+                matches = [ws for ws in sheets if ws.title == args.sheet]
+                if not matches:
+                    raise ValueError("worksheet {!r} not found; use --sheets to list names".format(args.sheet))
+                ws = matches[0]
+            else:
+                index = args.sheet_index or 1
+                if index > len(sheets):
+                    raise ValueError("sheet index {} exceeds {} worksheets".format(index, len(sheets)))
+                ws = sheets[index - 1]
+            if args.head == 0:
+                return
+            if args.reset_dimensions:
+                ws.reset_dimensions()
+            limit = 1 if args.header or args.columns else args.head
+            max_row = None if limit is None else args.header_row + limit - 1
+            rows = ws.iter_rows(min_row=args.header_row, max_row=max_row, values_only=True)
+            if limit is not None:
+                rows = itertools.islice(rows, limit)
+            writer = None
+            if args.tsv or args.csv:
+                writer = csv.writer(sys.stdout, delimiter="," if args.csv else "\t", lineterminator="\n")
+            for row in rows:
+                values = [cell_text(value) for value in row]
+                if args.columns:
+                    # Avoid trailing column entries created only by sheet formatting.
+                    while values and values[-1] == "":
+                        values.pop()
+                    output = ([str(i), get_column_letter(i), value] for i, value in enumerate(values, 1))
+                else:
+                    output = [values]
+                for fields in output:
+                    if writer:
+                        writer.writerow(fields)
+                    else:
+                        print("\t".join(escaped(value) for value in fields))
+        finally:
+            wb.close()
+
+
+def main():
+    args = parser().parse_args()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", newline="")
+    try:
+        run(args)
+        sys.stdout.flush()
+        return 0
+    except BrokenPipeError:
+        # `xlcat file.xlsx | head` should exit quietly, including under pipefail.
+        with open(os.devnull, "w") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print("xlcat: {}".format(escaped(str(exc))), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
